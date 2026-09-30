@@ -40,6 +40,8 @@ jobs:
           cache: false
       - name: Test mfcache
         working-directory: mfcache
+        env:
+          CGO_ENABLED: "1"
         run: go test -race ./...
       - run: go install "github.com/caddyserver/xcaddy/cmd/xcaddy@$XCADDY_VERSION"
       - name: Build linux/amd64 (hosts) and darwin/arm64 (local tests)
