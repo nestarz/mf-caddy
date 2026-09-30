@@ -123,7 +123,7 @@ func serve(w http.ResponseWriter, r *http.Request, e *entry, now time.Time) {
 	header.Set("Age", strconv.FormatInt(int64(e.age(now)/time.Second), 10))
 	header.Add("Cache-Status", "mf; hit")
 	w.WriteHeader(e.status)
-	if r.Method != http.MethodHead {
+	if r.Method != http.MethodHead && len(e.body) > 0 {
 		_, _ = w.Write(e.body)
 	}
 }

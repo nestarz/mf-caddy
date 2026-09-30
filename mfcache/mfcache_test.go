@@ -43,9 +43,17 @@ func (x *harness) fixed(status int, header ...string) func(http.ResponseWriter, 
 			w.Header().Add(header[i], header[i+1])
 		}
 		w.WriteHeader(status)
+		if !bodyAllowed(r.Method, status) {
+			return nil
+		}
 		_, err := fmt.Fprintf(w, "call %d", x.calls.Load())
 		return err
 	}
+}
+
+// bodyAllowed reports whether a response may carry content.
+func bodyAllowed(method string, status int) bool {
+	return method != http.MethodHead && status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 // do sends a request with header pairs, after the edge set the deployment header.
