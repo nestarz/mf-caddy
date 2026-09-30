@@ -1,0 +1,67 @@
+name: caddy
+# Builds the edge's Caddy with the cache-handler module at pinned versions and publishes it as the
+# release `caddy-<caddy>-cache-<cache-handler>`. Run by hand; the agent and the tests pin the digests
+# from its SHA256SUMS.
+on:
+  workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: Caddy release, without the leading v (for example 2.11.4)
+        required: true
+      cache_handler_version:
+        description: github.com/caddyserver/cache-handler release, without the leading v (for example 0.17.0)
+        required: true
+permissions:
+  contents: write
+env:
+  CADDY_VERSION: ${{ inputs.caddy_version }}
+  CACHE_HANDLER_VERSION: ${{ inputs.cache_handler_version }}
+  GO_VERSION: "1.27.1"
+  GOTOOLCHAIN: local
+  XCADDY_VERSION: v0.4.7
+  CGO_ENABLED: "0"
+  XCADDY_GO_BUILD_FLAGS: "-trimpath -ldflags '-w -s -buildid=' -tags nobadger,nomysql,nopgx"
+  # 2026-01-01T00:00:00Z: every archive entry carries this time, so rebuilding gives the same bytes.
+  SOURCE_DATE_EPOCH: "1767225600"
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the versions
+        run: |
+          for version in "$CADDY_VERSION" "$CACHE_HANDLER_VERSION"; do
+            echo "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a release version: $version"; exit 1; }
+          done
+          echo "TAG=caddy-$CADDY_VERSION-cache-$CACHE_HANDLER_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: go install "github.com/caddyserver/xcaddy/cmd/xcaddy@$XCADDY_VERSION"
+      - name: Build linux/amd64 (hosts) and darwin/arm64 (local tests)
+        run: |
+          mkdir dist
+          for target in linux/amd64 darwin/arm64; do
+            name="${target%/*}-${target#*/}"
+            mkdir -p "build/$name"
+            GOOS="${target%/*}" GOARCH="${target#*/}" xcaddy build "v$CADDY_VERSION" \
+              --with "github.com/caddyserver/cache-handler@v$CACHE_HANDLER_VERSION" \
+              --output "build/$name/caddy"
+            touch -d "@$SOURCE_DATE_EPOCH" "build/$name/caddy"
+            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" \
+              -C "build/$name" -cf - caddy | gzip -9n > "dist/caddy-$name.tar.gz"
+          done
+      - name: Check that the cache handler is in the build
+        run: build/linux-amd64/caddy list-modules | grep -x 'http.handlers.cache'
+      - name: Checksums of the archives and of their `caddy` entries
+        run: |
+          (cd dist && sha256sum caddy-*.tar.gz) > SHA256SUMS
+          (cd build && sha256sum */caddy) >> SHA256SUMS
+          mv SHA256SUMS dist/
+          cat dist/SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Caddy v$CADDY_VERSION with github.com/caddyserver/cache-handler v$CACHE_HANDLER_VERSION, built by the caddy workflow with Go $GO_VERSION and xcaddy $XCADDY_VERSION. Pin the digests in SHA256SUMS."
