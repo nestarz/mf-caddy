@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"maps"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +18,7 @@ const entryShare = 16
 // entry is one stored response. It is never changed once stored.
 type entry struct {
 	key        string
+	scope      string
 	status     int
 	header     http.Header
 	body       []byte
@@ -64,6 +66,7 @@ func (e *entry) bytes() int64 {
 // store holds entries by primary key, evicting the least recently used beyond max bytes.
 type store struct {
 	mu    sync.Mutex
+	epoch uint64
 	max   int64
 	size  int64
 	lru   *list.List
@@ -110,11 +113,25 @@ func (s *store) lookup(key string, request http.Header, now time.Time) (*entry, 
 
 // put stores e in place of the entry for the same variant, then evicts down to the bound.
 func (s *store) put(e *entry) {
+	s.putAt(e, s.generation())
+}
+
+// generation fences fills that began before an invalidation, without unbounded tag tombstones.
+func (s *store) generation() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.epoch
+}
+
+func (s *store) putAt(e *entry, epoch uint64) {
 	if e.size > int64(s.maxEntry()) {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if epoch != s.epoch {
+		return
+	}
 	for _, el := range s.byKey[e.key] {
 		if maps.Equal(el.Value.(*entry).vary, e.vary) {
 			s.remove(el)
@@ -132,6 +149,7 @@ func (s *store) put(e *entry) {
 func (s *store) invalidate(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.epoch++
 	for _, el := range s.byKey[key] {
 		s.remove(el)
 	}
@@ -162,4 +180,27 @@ func (s *store) Destruct() error {
 	s.byKey = map[string][]*list.Element{}
 	s.size = 0
 	return nil
+}
+
+// purge removes matching tags in this app only. Even an empty match fences in-flight fills.
+func (s *store) purge(scope string, tags map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.epoch++
+	for el := s.lru.Back(); el != nil; {
+		previous := el.Prev()
+		e := el.Value.(*entry)
+		if e.scope == scope {
+			matched := false
+			for _, line := range e.header.Values("Cache-Tag") {
+				for _, tag := range strings.Split(line, ",") {
+					matched = matched || tags[strings.TrimSpace(tag)]
+				}
+			}
+			if matched {
+				s.remove(el)
+			}
+		}
+		el = previous
+	}
 }

@@ -31,6 +31,11 @@ var stores = caddy.NewUsagePool()
 type Handler struct {
 	// MaxBytes bounds the bytes the shared store holds: bodies, headers and keys. Default 256 MiB.
 	MaxBytes int64 `json:"max_bytes,omitempty"`
+	// Scope isolates one app's entries across its hosts, deployments and Vary variants.
+	Scope string `json:"scope,omitempty"`
+	// PurgePath accepts authenticated tag purges. Only the SHA-256 of the bearer token is configured.
+	PurgePath      string `json:"purge_path,omitempty"`
+	PurgeTokenHash string `json:"purge_token_hash,omitempty"`
 
 	store   *store
 	poolKey string
@@ -47,6 +52,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision attaches the handler to the store for its bound.
 func (h *Handler) Provision(caddy.Context) error {
+	if err := h.validatePurge(); err != nil {
+		return err
+	}
 	if h.MaxBytes < 0 {
 		return fmt.Errorf("max_bytes must not be negative: %d", h.MaxBytes)
 	}
@@ -74,10 +82,13 @@ func (h *Handler) Cleanup() error {
 // ServeHTTP answers a fresh matching entry from the store, and otherwise forwards the request and
 // stores the response when the contract allows it. Concurrent misses each reach the origin.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if h.PurgePath != "" && r.URL.Path == h.PurgePath {
+		return h.purge(w, r)
+	}
 	if r.Header.Get("Upgrade") != "" {
 		return next.ServeHTTP(w, r)
 	}
-	key := primaryKey(r)
+	key := h.Scope + "\x00" + primaryKey(r)
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		c := newCapture(w, "mf; fwd=method", func(int, http.Header) (string, bool) { return "", false })
 		if err := next.ServeHTTP(c, r); err != nil {
@@ -89,6 +100,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		return nil
 	}
+	epoch := h.store.generation()
 	requested := h.now()
 	e, fwd := h.store.lookup(key, r.Header, requested)
 	if e != nil {
@@ -109,7 +121,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	c.finish()
 	if d.detail == "" && c.complete() {
-		h.store.put(d.entry(key, r.Header, c.body.Bytes()))
+		e := d.entry(key, r.Header, c.body.Bytes())
+		e.scope = h.Scope
+		e.size += int64(len(h.Scope))
+		h.store.putAt(e, epoch)
 	}
 	return nil
 }

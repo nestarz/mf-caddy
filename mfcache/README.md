@@ -47,7 +47,7 @@ handler in the process with the same bound shares one store, which survives conf
 
 What it does not do: no request coalescing (concurrent misses each reach the origin), no stale
 serving of any kind, no revalidation, no range or conditional handling (a hit is the whole stored
-response), no purge API and no persistence. Request `Cache-Control` directives other than
+response), and no persistence. Request `Cache-Control` directives other than
 `no-store` are ignored, as a shared cache in front of an origin may.
 
 ## Tests
@@ -57,3 +57,16 @@ go test ./...
 ```
 
 Each contract point above has a test in `mfcache_test.go`.
+
+## Tag purging
+
+Set `scope` to a stable app identifier on each cache route. Set `purge_path` and
+`purge_token_hash` (hex SHA-256) on a route for that scope. A `POST` with a bearer token and
+`{"tags":["product:1"]}` removes entries whose `Cache-Tag` contains an exact matching tag.
+The request permits 1–500 tags, at most 256 bytes each, in a body of at most 64 KiB.
+
+A local purge returns 204 after all matching hosts, deployments and variants in that scope
+are removed. It fences fills started before the purge. Other scopes remain cached.
+The mf fleet API calls this endpoint on every ingress host and fails if any host does not
+confirm. It stores only token hashes in Caddy configuration. No special response extension
+or path rule makes private content cacheable.
