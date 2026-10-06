@@ -120,6 +120,7 @@ appends a new origin response to a partial cached body.
 Concurrent GET misses with identical headers, keys and purge generations share one fill while
 capacity permits. Header values are hashed for coordination; the response Vary policy still governs
 reuse. Waiters resume on RAM publication or fill completion and recheck the cache independently.
+Uncacheable response headers release them immediately, without waiting for the response body.
 At most `max_concurrent_reads` requests wait, for at most two seconds; excess or timed-out requests
 fall back to the origin. Cancelled waiters leave without another fetch. Distinct headers deliberately
 do not coalesce, since Vary is not yet known. Active coordination records are bounded by

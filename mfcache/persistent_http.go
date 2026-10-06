@@ -222,6 +222,9 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 	c := newCapture(w, "mf; fwd=uri-miss", func(status int, header http.Header) (string, bool) {
 		d = decide(r, status, header, requested, h.now(), int(p.config.MaxObjectBytes))
 		if d.detail != "" {
+			if ready != nil {
+				ready() // A private or uncacheable stream must not delay other requests.
+			}
 			return "detail=" + d.detail, false
 		}
 		return "detail=fill", true

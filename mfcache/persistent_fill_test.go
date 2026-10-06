@@ -237,3 +237,42 @@ func TestPersistentCoalescingWaitIsBounded(t *testing.T) {
 		t.Fatal("waiter permit leaked")
 	}
 }
+
+func TestPersistentUncacheableHeadersReleaseWaiters(t *testing.T) {
+	x, _ := persistentHarness(t, 32<<20)
+	started, headers, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var headerOnce, finishOnce sync.Once
+	defer headerOnce.Do(func() { close(headers) })
+	defer finishOnce.Do(func() { close(finish) })
+	x.origin = func(w http.ResponseWriter, r *http.Request) error {
+		first := x.calls.Load() == 1
+		if first {
+			close(started)
+			<-headers
+		}
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.WriteHeader(200)
+		if first {
+			<-finish
+		}
+		_, err := w.Write([]byte("private"))
+		return err
+	}
+	leader := make(chan *httptest.ResponseRecorder, 1)
+	go func() { leader <- x.do("GET", "/") }()
+	<-started
+	waiter := make(chan *httptest.ResponseRecorder, 1)
+	go func() { waiter <- x.do("GET", "/") }()
+	waitForCache(t, func() bool { return len(x.h.persistent.waiters) == 1 })
+	headerOnce.Do(func() { close(headers) })
+	select {
+	case response := <-waiter:
+		if response.Body.String() != "private" || x.calls.Load() != 2 {
+			t.Fatal("private response was shared")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("private headers did not release waiter")
+	}
+	finishOnce.Do(func() { close(finish) })
+	<-leader
+}
