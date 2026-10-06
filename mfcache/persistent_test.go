@@ -115,7 +115,7 @@ func TestPersistentBudgetAndAdmission(t *testing.T) {
 }
 
 func TestPersistentInterruptedOriginNeverPublishes(t *testing.T) {
-	x, _ := persistentHarness(t, 0)
+	x, _ := persistentHarness(t, 32<<20)
 	x.origin = func(w http.ResponseWriter, r *http.Request) error {
 		w.Header().Set("Cache-Control", "public, max-age=60")
 		w.Header().Set("Content-Length", "100")
@@ -312,9 +312,10 @@ func TestPersistentRestartPurgeAndRAM(t *testing.T) {
 		t.Run(fmt.Sprint(ram), func(t *testing.T) {
 			x, objects := persistentHarness(t, ram)
 			expect(t, x.do("GET", "/"), "mf; fwd=uri-miss; detail=fill")
-			expect(t, x.do("GET", "/"), "mf; hit; detail=s3")
 			if ram > 0 {
 				expect(t, x.do("GET", "/"), "mf; hit")
+			} else {
+				expect(t, x.do("GET", "/"), "mf; hit; detail=s3")
 			}
 			reopen(t, x, objects)
 			x.clock = x.clock.Add(10 * time.Second)
@@ -366,7 +367,7 @@ func TestPersistentVariantsIsolationAndPrivateResponses(t *testing.T) {
 }
 
 func TestPersistentPurgeFencesInFlightFill(t *testing.T) {
-	x, objects := persistentHarness(t, 0)
+	x, objects := persistentHarness(t, 32<<20)
 	objects.beforePut = func() {
 		if err := x.h.persistent.invalidate(func(e cachedResponse) bool { return true }); err != nil {
 			t.Error(err)

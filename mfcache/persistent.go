@@ -121,6 +121,9 @@ type persistentStore struct {
 	epoch           uint64
 	invalid         bool
 	reads, fills    chan struct{}
+	flightMu        sync.Mutex
+	flights         map[string]*cacheFlight
+	waiters         chan struct{}
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -196,7 +199,8 @@ func newPersistent(c PersistentConfig, private, public ObjectStore) (*persistent
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &persistentStore{config: c, db: db, private: private, public: public, ram: newStore(c.RAMBytes),
-		reads: make(chan struct{}, c.MaxConcurrentReads), fills: make(chan struct{}, c.MaxConcurrentFills), ctx: ctx, cancel: cancel, metrics: newCacheMetrics()}
+		reads: make(chan struct{}, c.MaxConcurrentReads), fills: make(chan struct{}, c.MaxConcurrentFills), ctx: ctx, cancel: cancel, metrics: newCacheMetrics(),
+		flights: make(map[string]*cacheFlight), waiters: make(chan struct{}, c.MaxConcurrentReads)}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{responsesBucket, objectsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
