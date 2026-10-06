@@ -58,7 +58,14 @@ func (h *Handler) purge(w http.ResponseWriter, r *http.Request) error {
 		}
 		tags[tag] = true
 	}
-	h.store.purge(h.Scope, tags)
+	if h.persistent != nil {
+		if err := h.persistent.invalidate(func(e cachedResponse) bool { return tagged(e, h.Scope, tags) }); err != nil {
+			http.Error(w, "cache invalidation could not be persisted", http.StatusServiceUnavailable)
+			return nil
+		}
+	} else {
+		h.store.purge(h.Scope, tags)
+	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
