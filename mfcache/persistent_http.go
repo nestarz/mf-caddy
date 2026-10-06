@@ -242,9 +242,10 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 		p.metrics.skipped.Add(1)
 		return nil
 	}
-	// The client has received the response, but this bounded synchronous fill retains its slot and
-	// file until PUT completes. Client cancellation aborts the upload instead of orphaning a task.
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	// Only a complete response reaches this point. A downstream proxy may close its stream as
+	// soon as it has the body, so the upload belongs to the cache lifetime, not that request.
+	// It remains synchronous, bounded by the existing fill slot, timeout and spool-file limits.
+	ctx, cancel := context.WithTimeout(p.ctx, 2*time.Minute)
 	defer cancel()
 	if err := p.backend(public).Put(ctx, object, file, c.copied); err != nil {
 		p.metrics.errors.Add(1)

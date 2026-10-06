@@ -34,6 +34,42 @@ type fileObjects struct {
 	open                func(context.Context, string) (io.ReadCloser, int64, error)
 }
 
+type cancellationAwareObjects struct{ *fileObjects }
+
+func (s cancellationAwareObjects) Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.fileObjects.Put(ctx, key, body, size)
+}
+
+func TestPersistentCompletedResponseSurvivesClientCancellation(t *testing.T) {
+	x, objects := persistentHarness(t, 0)
+	x.h.persistent.private = cancellationAwareObjects{objects}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
+	r.Header.Set(DeploymentHeader, "app-r1-00000000")
+	w := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		x.calls.Add(1)
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("Content-Length", "8")
+		_, err := w.Write([]byte("complete"))
+		cancel() // A downstream proxy has the complete response and closes its origin stream.
+		return err
+	})
+	if err := x.h.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
+	}
+	x.origin = x.fixed(200, "Cache-Control", "public, max-age=60")
+	response := x.do("GET", "/")
+	expect(t, response, "mf; hit; detail=s3")
+	if response.Body.String() != "complete" || x.calls.Load() != 1 {
+		t.Fatal("completed fill was lost after downstream cancellation")
+	}
+}
+
 func TestPersistentBudgetAndAdmission(t *testing.T) {
 	x, objects := persistentHarness(t, 0)
 	p := x.h.persistent
