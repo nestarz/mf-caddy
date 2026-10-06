@@ -46,8 +46,8 @@ handler in the process with the same bound shares one store, which survives conf
    time the response took to arrive.
 
 What it does not do: no request coalescing (concurrent misses each reach the origin), no stale
-serving of any kind, no revalidation, no range or conditional handling (a hit is the whole stored
-response), and no persistence. Request `Cache-Control` directives other than
+serving of any kind, no revalidation, or range or conditional handling (a hit is the whole stored
+response). Request `Cache-Control` directives other than
 `no-store` are ignored, as a shared cache in front of an origin may.
 
 ## Tests
@@ -70,3 +70,74 @@ are removed. It fences fills started before the purge. Other scopes remain cache
 The mf fleet API calls this endpoint on every ingress host and fails if any host does not
 confirm. It stores only token hashes in Caddy configuration. No special response extension
 or path rule makes private content cacheable.
+
+## Persistent S3 bodies
+
+Set `persistent` on each cache and purge handler to share a private local index and S3 bodies:
+
+```json
+{
+  "handler": "mf_cache",
+  "scope": "app",
+  "persistent": {
+    "connection_file": "/run/credentials/mf-proxy.service/cache-store.json",
+    "index_path": "/var/lib/mf-cache/namespace/index.db",
+    "ram_bytes": 33554432,
+    "ram_entry_bytes": 131072,
+    "stream_buffer_bytes": 65536,
+    "max_object_bytes": 67108864,
+    "max_store_bytes": 2147483648,
+    "max_concurrent_reads": 64,
+    "max_concurrent_fills": 4
+  }
+}
+```
+
+`ram_bytes: 0` disables RAM bodies. With persistence, `max_bytes` is unused. The legacy memory-only
+mode remains available by omitting `persistent`. All handlers using an index share its budgets.
+
+The protected connection file contains `private` and optionally `public` S3 connections, each
+with `endpoint`, `bucket`, `prefix`, `region`, `path_style`, `access_key`, `secret_key`, optional
+`session_token`, and optional `spki` (hex SHA-256 of a trusted TLS public key). `public_read_url`
+optionally names an HTTPS CDN URL including the public object's prefix. Use a dedicated namespace
+per host and never share an index between processes. Endpoint and bucket changes require a new index.
+Budget or credential changes require a Caddy restart; route-only reloads keep the store.
+
+Bodies stream from the S3 SDK or the CDN with bounded buffers. Only objects below `ram_entry_bytes`
+and the RAM tier's per-entry bound may be copied into RAM. Cached HEAD responses need no body GET.
+Hits carry `Cache-Status: mf; hit; detail=s3|cdn`; RAM hits retain `mf; hit`.
+
+Fills stream to clients and a bounded private spool file, then upload from that seekable file.
+The response is indexed only after the full body and PUT succeed. No unbounded upload goroutines
+or queues are created. Fill saturation skips population; read saturation returns 503/Retry-After.
+Each PUT has a two-minute deadline, reads five minutes, and backend response headers ten seconds.
+Disconnects cancel S3 operations. An error after response bytes start aborts that response; it never
+appends a new origin response to a partial cached body.
+
+The embedded index persists freshness, hashed Vary values, and tag mappings, not response bodies.
+Purge commits index removal before acknowledgement and fences in-flight fills and RAM promotions.
+Object deletion is deferred; failed deletes retain their budget reservation. Entries expire, and
+the oldest entries are evicted under storage pressure. Metadata is bounded to 8192 objects and 16 KiB
+per response record. Temporary files are removed on completion or restart. A bounded S3 LIST sweep
+also removes unknown objects older than 24 hours after index loss, under this host's prefix only.
+Index loss causes misses; indexes are not shared between hosts. Changing storage location starts a
+cold namespace; retire/clean the old location separately before removing its credentials.
+
+Public CDN reads require a separate bucket. Only explicitly public responses to requests without
+Cookie or Authorization and with no Vary other than Accept-Encoding enter it. General shared
+variants stay private; private/no-store/Set-Cookie responses are never stored. Never expose the
+artifact bucket. CDN reads receive no visitor headers or storage credentials and never follow
+redirects. On a failed CDN open, MF tries the same immutable body through authenticated S3.
+The browser keeps its original URL. Public immutable body URLs can remain in a CDN for their
+transport TTL (one day); tag purging invalidates application URLs, not previously disclosed public
+body URLs. Do not use this mode for revocable content.
+
+R2's S3 API already has free egress. A custom domain adds CDN caching, not free VPS outbound traffic
+or guaranteed sub-millisecond latency. Configure its cache rule for opaque object keys explicitly;
+the module does not provision a CDN, publish a bucket, or require a Worker.
+
+The private Caddy metrics registry exports `mf_cache_*_total` counters for RAM/S3/CDN hits,
+streamed bytes, fills, skipped fills, errors, evictions, deleted objects, and purges.
+
+Run `go test -race ./...`. Set `MF_TEST_RUSTFS` to a local RustFS executable to include a real
+signed S3 fill/read/delete integration, in addition to the TLS and streaming fixtures.

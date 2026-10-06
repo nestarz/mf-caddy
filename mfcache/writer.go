@@ -2,6 +2,7 @@ package mfcache
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"strconv"
 )
@@ -18,6 +19,8 @@ type capture struct {
 	keep    bool
 	failed  bool
 	body    bytes.Buffer
+	sink    io.Writer
+	copied  int64
 	written bool
 }
 
@@ -58,15 +61,26 @@ func (c *capture) Write(b []byte) (int, error) {
 		c.WriteHeader(http.StatusOK)
 	}
 	if c.keep {
-		if c.body.Len()+len(b) > c.limit {
+		if c.copied+int64(len(b)) > int64(c.limit) {
 			c.keep = false
 			c.body = bytes.Buffer{}
 		} else {
-			c.body.Write(b)
+			var err error
+			var written int
+			if c.sink != nil {
+				written, err = c.sink.Write(b)
+			} else {
+				written, err = c.body.Write(b)
+			}
+			if err != nil || written != len(b) {
+				c.keep = false
+			} else {
+				c.copied += int64(len(b))
+			}
 		}
 	}
 	n, err := c.ResponseWriter.Write(b)
-	if err != nil {
+	if err != nil || n != len(b) {
 		c.failed = true
 	}
 	return n, err
@@ -99,5 +113,5 @@ func (c *capture) complete() bool {
 	if !c.keep || c.failed {
 		return false
 	}
-	return c.length < 0 || int64(c.body.Len()) == c.length
+	return c.length < 0 || c.copied == c.length
 }
