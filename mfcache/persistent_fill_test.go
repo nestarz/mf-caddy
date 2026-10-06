@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -275,4 +276,73 @@ func TestPersistentUncacheableHeadersReleaseWaiters(t *testing.T) {
 	}
 	finishOnce.Do(func() { close(finish) })
 	<-leader
+}
+
+func TestPersistentHTTP2CoalescesEmptyRequestBodies(t *testing.T) {
+	x, _ := persistentHarness(t, 32<<20)
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var requests sync.WaitGroup
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 {
+			t.Error("fixture did not use HTTP/2")
+		}
+		r.Header.Set(DeploymentHeader, "app-r1-00000000")
+		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			if x.calls.Add(1) == 1 {
+				close(started)
+			}
+			<-release
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			_, err := w.Write([]byte("complete"))
+			return err
+		})
+		if err := x.h.ServeHTTP(w, r, next); err != nil {
+			t.Error(err)
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer func() { once.Do(func() { close(release) }); requests.Wait(); server.Close() }()
+	client := server.Client()
+	client.Timeout = 5 * time.Second
+	const count = 9
+	results := make(chan string, count)
+	send := func() {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			response, err := client.Get(server.URL)
+			if err != nil {
+				results <- err.Error()
+				return
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil || string(body) != "complete" {
+				results <- "incomplete response"
+				return
+			}
+			results <- response.Header.Get("Cache-Status")
+		}()
+	}
+	send()
+	<-started
+	for i := 1; i < count; i++ {
+		send()
+	}
+	waitForCache(t, func() bool { return len(x.h.persistent.waiters) == count-1 })
+	once.Do(func() { close(release) })
+	hits := 0
+	for i := 0; i < count; i++ {
+		result := <-results
+		if result == "mf; hit" {
+			hits++
+		} else if result != "mf; fwd=uri-miss; detail=fill" {
+			t.Error(result)
+		}
+	}
+	if hits != count-1 || x.calls.Load() != 1 {
+		t.Fatal("HTTP/2 misses were not coalesced", hits, x.calls.Load())
+	}
 }

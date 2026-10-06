@@ -115,7 +115,7 @@ func (h *Handler) Cleanup() error {
 }
 
 // ServeHTTP answers a fresh matching entry from the store, and otherwise forwards the request and
-// stores the response when the contract allows it. Concurrent misses each reach the origin.
+// stores the response when the contract allows it. Persistent mode coalesces matching misses.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if h.PurgePath != "" && r.URL.Path == h.PurgePath {
 		return h.purge(w, r)

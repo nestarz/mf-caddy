@@ -147,7 +147,7 @@ func (h *Handler) servePersistentAttempt(w http.ResponseWriter, r *http.Request,
 		}
 		p.metrics.errors.Add(1)
 	}
-	if coordinate && r.Method == http.MethodGet && (r.Body == nil || r.Body == http.NoBody) {
+	if coordinate && r.Method == http.MethodGet && r.ContentLength == 0 {
 		return h.coalesceFill(w, r, next, key, epoch)
 	}
 	return h.fillPersistent(w, r, next, key, epoch, now, ready)
