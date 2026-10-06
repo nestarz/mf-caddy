@@ -45,9 +45,8 @@ handler in the process with the same bound shares one store, which survives conf
    A hit carries `Age` as RFC 9111 §4.2.3 computes it, from the origin's `Date` and `Age` and the
    time the response took to arrive.
 
-What it does not do: no request coalescing (concurrent misses each reach the origin), no stale
-serving of any kind, no revalidation, or range or conditional handling (a hit is the whole stored
-response). Request `Cache-Control` directives other than
+The memory-only mode does not coalesce concurrent misses. Neither mode serves stale responses,
+revalidates, or handles ranges or conditions (a hit is the whole stored response). Request `Cache-Control` directives other than
 `no-store` are ignored, as a shared cache in front of an origin may.
 
 ## Tests
@@ -108,11 +107,23 @@ and the RAM tier's per-entry bound may be copied into RAM. Cached HEAD responses
 Hits carry `Cache-Status: mf; hit; detail=s3|cdn`; RAM hits retain `mf; hit`.
 
 Fills stream to clients and a bounded private spool file, then upload from that seekable file.
-The response is indexed only after the full body and PUT succeed. No unbounded upload goroutines
+A complete small response enters RAM before the PUT; the persistent entry is indexed only after
+the full body and PUT succeed. RAM reuse remains valid if persistence fails, until expiry, eviction
+or purge. Large responses never acquire a body-sized RAM buffer. No unbounded upload goroutines
 or queues are created. Fill saturation skips population; read saturation returns 503/Retry-After.
 Each PUT has a two-minute deadline, reads five minutes, and backend response headers ten seconds.
-Disconnects cancel S3 operations. An error after response bytes start aborts that response; it never
+Disconnects cancel reads. After complete capture, PUT uses the cache lifetime, so a downstream
+disconnect cannot cancel persistence. An origin error, truncated body or client write failure
+prevents publication in both tiers. An error after response bytes start aborts that response; it never
 appends a new origin response to a partial cached body.
+
+Concurrent GET misses with identical headers, keys and purge generations share one fill while
+capacity permits. Header values are hashed for coordination; the response Vary policy still governs
+reuse. Waiters resume on RAM publication or fill completion and recheck the cache independently.
+At most `max_concurrent_reads` requests wait, for at most two seconds; excess or timed-out requests
+fall back to the origin. Cancelled waiters leave without another fetch. Distinct headers deliberately
+do not coalesce, since Vary is not yet known. Active coordination records are bounded by
+`max_concurrent_fills`.
 
 The embedded index persists freshness, hashed Vary values, and tag mappings, not response bodies.
 Purge commits index removal before acknowledgement and fences in-flight fills and RAM promotions.

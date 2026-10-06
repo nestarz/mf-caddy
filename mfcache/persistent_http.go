@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,6 +51,10 @@ func reusable(r *http.Request, e *entry) bool {
 }
 
 func (h *Handler) servePersistent(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	return h.servePersistentAttempt(w, r, next, true, nil)
+}
+
+func (h *Handler) servePersistentAttempt(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, coordinate bool, ready func()) error {
 	p := h.persistent
 	key := h.Scope + "\x00" + primaryKey(r)
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -141,7 +147,10 @@ func (h *Handler) servePersistent(w http.ResponseWriter, r *http.Request, next c
 		}
 		p.metrics.errors.Add(1)
 	}
-	return h.fillPersistent(w, r, next, key, epoch, now)
+	if coordinate && r.Method == http.MethodGet && (r.Body == nil || r.Body == http.NoBody) {
+		return h.coalesceFill(w, r, next, key, epoch)
+	}
+	return h.fillPersistent(w, r, next, key, epoch, now, ready)
 }
 
 func writeCachedHeader(w http.ResponseWriter, e *cachedResponse, now time.Time, source string) {
@@ -191,7 +200,7 @@ func publicBody(r *http.Request, d decision) bool {
 	return d.detail == ""
 }
 
-func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64, requested time.Time) error {
+func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64, requested time.Time, ready func()) error {
 	p := h.persistent
 	if r.Method != http.MethodGet {
 		return next.ServeHTTP(w, r)
@@ -231,6 +240,29 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 		p.metrics.errors.Add(1)
 		return nil
 	}
+	// Publish complete small bodies independently of S3. This remains useful even when the
+	// persistent quota is full or an upload fails; RAM keeps its own TTL and byte budget.
+	if p.config.RAMBytes > 0 && c.copied <= p.config.RAMEntryBytes && c.copied <= int64(p.ram.maxEntry()) {
+		body := make([]byte, int(c.copied))
+		if _, err := io.ReadFull(file, body); err == nil {
+			cached := d.entry(key, r.Header, body)
+			cached.scope = h.Scope
+			cached.size = cached.bytes()
+			p.mu.Lock()
+			publish := p.epoch == epoch && !p.invalid && cached.size <= int64(p.ram.maxEntry())
+			if publish {
+				p.ram.put(cached)
+			}
+			p.mu.Unlock()
+			if publish && ready != nil {
+				ready()
+			}
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			p.metrics.errors.Add(1)
+			return nil
+		}
+	}
 	var random [24]byte
 	if _, err = rand.Read(random[:]); err != nil {
 		p.metrics.errors.Add(1)
@@ -262,4 +294,57 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 	}
 	p.metrics.fills.Add(1)
 	return nil
+}
+
+// Coalescing only delays requests; each waiter rechecks normal cache policy before reuse.
+// Hash every request header because Vary is unknown until the origin responds. A purge starts
+// a new generation, so post-purge requests never wait on an obsolete fill.
+type cacheFlight struct {
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (f *cacheFlight) release() { f.once.Do(func() { close(f.ready) }) }
+
+func (h *Handler) coalesceFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64) error {
+	p := h.persistent
+	headers, _ := json.Marshal(r.Header)
+	id := digest(key + "\x00" + strconv.FormatUint(epoch, 10) + "\x00" + string(headers))
+	p.flightMu.Lock()
+	flight := p.flights[id]
+	if flight == nil && len(p.flights) < p.config.MaxConcurrentFills {
+		flight = &cacheFlight{ready: make(chan struct{})}
+		p.flights[id] = flight
+		p.flightMu.Unlock()
+		defer func() {
+			p.flightMu.Lock()
+			delete(p.flights, id)
+			flight.release()
+			p.flightMu.Unlock()
+		}()
+		// Another fill may have published between our first lookup and registration.
+		return h.servePersistentAttempt(w, r, next, false, flight.release)
+	}
+	p.flightMu.Unlock()
+	if flight != nil {
+		select {
+		case p.waiters <- struct{}{}:
+			defer func() { <-p.waiters }()
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				return r.Context().Err()
+			case <-p.ctx.Done():
+				return p.ctx.Err()
+			case <-flight.ready:
+			case <-timer.C:
+			}
+		default: // Bounded waiting; excess traffic follows the existing origin path.
+		}
+	}
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
+	return h.servePersistentAttempt(w, r, next, false, nil)
 }
