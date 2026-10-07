@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -43,8 +44,13 @@ func TestPersistentRAMBeforeUpload(t *testing.T) {
 	if response.Body.String() != "call 1" || x.calls.Load() != 1 {
 		t.Fatal("RAM waited for upload")
 	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("origin response waited for S3 upload")
+	}
 	unblock()
-	<-done
+	x.h.persistent.uploadWG.Wait()
 	expect(t, x.do("GET", "/"), "mf; hit")
 	reopen(t, x, objects)
 	objects.beforePut = nil
@@ -97,6 +103,7 @@ func TestPersistentCoalescedFill(t *testing.T) {
 			}
 			releaseUpload()
 			<-leader
+			x.h.persistent.uploadWG.Wait()
 			if x.calls.Load() != 1 {
 				t.Fatal("duplicate origin calls", x.calls.Load())
 			}
@@ -137,6 +144,7 @@ func TestPersistentCoalescingKeepsVariantsIndependent(t *testing.T) {
 	}
 	once.Do(func() { close(release) })
 	<-done
+	x.h.persistent.uploadWG.Wait()
 	r := httptest.NewRequest("GET", "/", nil)
 	r.Header.Set(DeploymentHeader, "app-r1-00000000")
 	r.Header.Set("Cookie", "first")
@@ -344,5 +352,51 @@ func TestPersistentHTTP2CoalescesEmptyRequestBodies(t *testing.T) {
 	}
 	if hits != count-1 || x.calls.Load() != 1 {
 		t.Fatal("HTTP/2 misses were not coalesced", hits, x.calls.Load())
+	}
+}
+
+func TestPersistentSlowUploadsDoNotHoldHTTPResponsesAndStayBounded(t *testing.T) {
+	x, objects := persistentHarness(t, 0)
+	p := x.h.persistent
+	entered, release := make(chan struct{}, cap(p.fills)), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	objects.beforePut = func() { entered <- struct{}{}; <-release }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set(DeploymentHeader, "app-r1-00000000")
+		if err := x.h.ServeHTTP(w, r, caddyhttp.HandlerFunc(x.origin)); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = time.Second
+	for i := 0; i <= cap(p.fills); i++ {
+		response, err := client.Get(fmt.Sprintf("%s/%d", server.URL, i))
+		if err != nil {
+			t.Fatal("response blocked on object storage", err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || len(body) == 0 || response.StatusCode != 200 {
+			t.Fatal("HTTP completion lost", err)
+		}
+		if i < cap(p.fills) {
+			<-entered
+		}
+	}
+	if len(p.fills) != cap(p.fills) {
+		t.Fatal("upload did not retain admission")
+	}
+	spools, _ := filepath.Glob(p.config.IndexPath + ".fill-*")
+	if len(spools) != cap(p.fills) {
+		t.Fatal("unbounded or missing spools", len(spools))
+	}
+	unblock()
+	p.uploadWG.Wait()
+	spools, _ = filepath.Glob(p.config.IndexPath + ".fill-*")
+	if len(spools) != 0 || len(p.fills) != 0 {
+		t.Fatal("upload resources leaked")
 	}
 }

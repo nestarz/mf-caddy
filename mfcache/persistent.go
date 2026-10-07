@@ -127,6 +127,9 @@ type persistentStore struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
+	uploadMu        sync.Mutex
+	uploadWG        sync.WaitGroup
+	closing         bool
 	metrics         *cacheMetrics
 	orphanCursor    [2]string
 	orphanNext      [2]time.Time
@@ -247,7 +250,25 @@ func (p *persistentStore) startMaintenance() {
 	}()
 }
 
-func (p *persistentStore) Destruct() error { p.cancel(); p.wg.Wait(); return p.db.Close() }
+func (p *persistentStore) startUpload(upload func()) bool {
+	p.uploadMu.Lock()
+	defer p.uploadMu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.uploadWG.Add(1)
+	go func() { defer p.uploadWG.Done(); upload() }()
+	return true
+}
+func (p *persistentStore) Destruct() error {
+	p.uploadMu.Lock()
+	p.closing = true
+	p.cancel()
+	p.uploadMu.Unlock()
+	p.uploadWG.Wait()
+	p.wg.Wait()
+	return p.db.Close()
+}
 
 // S3-compatible LIST recovers abandoned bodies when the local index is lost. The dedicated
 // host prefix and a 24-hour grace period exclude active uploads and every artifact object.
