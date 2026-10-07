@@ -76,7 +76,9 @@ func TestPersistentBudgetAndAdmission(t *testing.T) {
 	p.config.MaxObjectBytes = 8
 	p.config.MaxStoreBytes = 8
 	x.do("GET", "/a")
+	x.h.persistent.uploadWG.Wait()
 	x.do("GET", "/b")
+	x.h.persistent.uploadWG.Wait()
 	files, _ := os.ReadDir(objects.dir)
 	if len(files) != 1 {
 		t.Fatal("storage quota exceeded")
@@ -92,6 +94,7 @@ func TestPersistentBudgetAndAdmission(t *testing.T) {
 	objects.failDelete = false
 	p.collect(x.clock.Add(time.Hour))
 	x.do("GET", "/d")
+	x.h.persistent.uploadWG.Wait()
 	for i := 0; i < cap(p.reads); i++ {
 		p.reads <- struct{}{}
 	}
@@ -374,11 +377,13 @@ func TestPersistentPurgeFencesInFlightFill(t *testing.T) {
 		}
 	}
 	x.do("GET", "/")
+	x.h.persistent.uploadWG.Wait()
 	objects.beforePut = nil
 	x.do("GET", "/")
 	if x.calls.Load() != 2 {
 		t.Fatal("pre-purge fill returned")
 	}
+	x.h.persistent.uploadWG.Wait()
 	x.h.persistent.collect(x.clock.Add(2 * time.Hour))
 	files, _ := os.ReadDir(objects.dir)
 	if len(files) != 0 {
@@ -390,11 +395,13 @@ func TestPersistentFailedAndOversizedFills(t *testing.T) {
 	x, objects := persistentHarness(t, 0)
 	objects.failPut = true
 	x.do("GET", "/")
+	x.h.persistent.uploadWG.Wait()
 	objects.failPut = false
 	x.do("GET", "/")
 	if x.calls.Load() != 2 {
 		t.Fatal("failed PUT published")
 	}
+	x.h.persistent.uploadWG.Wait()
 	x.h.persistent.config.MaxObjectBytes = 4
 	x.origin = x.fixed(200, "Cache-Control", "public, max-age=60")
 	x.do("GET", "/large")
@@ -548,6 +555,7 @@ func TestPublicCDNReadFallbackAndClassification(t *testing.T) {
 		t.Fatal("public destination not used")
 	}
 	x.do("GET", "/cookie", "Cookie", "consent=yes")
+	p.uploadWG.Wait()
 	files, _ = os.ReadDir(private.dir)
 	if len(files) != 1 {
 		t.Fatal("cookie variant exposed")

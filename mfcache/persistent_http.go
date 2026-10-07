@@ -54,7 +54,7 @@ func (h *Handler) servePersistent(w http.ResponseWriter, r *http.Request, next c
 	return h.servePersistentAttempt(w, r, next, true, nil)
 }
 
-func (h *Handler) servePersistentAttempt(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, coordinate bool, ready func()) error {
+func (h *Handler) servePersistentAttempt(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, coordinate bool, flight *cacheFlight) error {
 	p := h.persistent
 	key := h.Scope + "\x00" + primaryKey(r)
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -150,7 +150,7 @@ func (h *Handler) servePersistentAttempt(w http.ResponseWriter, r *http.Request,
 	if coordinate && r.Method == http.MethodGet && r.ContentLength == 0 {
 		return h.coalesceFill(w, r, next, key, epoch)
 	}
-	return h.fillPersistent(w, r, next, key, epoch, now, ready)
+	return h.fillPersistent(w, r, next, key, epoch, now, flight)
 }
 
 func writeCachedHeader(w http.ResponseWriter, e *cachedResponse, now time.Time, source string) {
@@ -200,7 +200,7 @@ func publicBody(r *http.Request, d decision) bool {
 	return d.detail == ""
 }
 
-func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64, requested time.Time, ready func()) error {
+func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64, requested time.Time, flight *cacheFlight) error {
 	p := h.persistent
 	if r.Method != http.MethodGet {
 		return next.ServeHTTP(w, r)
@@ -211,19 +211,29 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 		p.metrics.skipped.Add(1)
 		return next.ServeHTTP(w, r)
 	}
-	defer func() { <-p.fills }()
+	transferred := false
+	defer func() {
+		if !transferred {
+			<-p.fills
+		}
+	}()
 	file, err := os.CreateTemp(filepath.Dir(p.config.IndexPath), filepath.Base(p.config.IndexPath)+".fill-*")
 	if err != nil {
 		p.metrics.errors.Add(1)
 		return next.ServeHTTP(w, r)
 	}
-	defer func() { file.Close(); os.Remove(file.Name()) }()
+	defer func() {
+		if !transferred {
+			file.Close()
+			os.Remove(file.Name())
+		}
+	}()
 	var d decision
 	c := newCapture(w, "mf; fwd=uri-miss", func(status int, header http.Header) (string, bool) {
 		d = decide(r, status, header, requested, h.now(), int(p.config.MaxObjectBytes))
 		if d.detail != "" {
-			if ready != nil {
-				ready() // A private or uncacheable stream must not delay other requests.
+			if flight != nil {
+				flight.release() // A private or uncacheable stream must not delay other requests.
 			}
 			return "detail=" + d.detail, false
 		}
@@ -257,8 +267,8 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 				p.ram.put(cached)
 			}
 			p.mu.Unlock()
-			if publish && ready != nil {
-				ready()
+			if publish && flight != nil {
+				flight.release()
 			}
 		}
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -277,25 +287,38 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 		p.metrics.skipped.Add(1)
 		return nil
 	}
-	// Only a complete response reaches this point. A downstream proxy may close its stream as
-	// soon as it has the body, so the upload belongs to the cache lifetime, not that request.
-	// It remains synchronous, bounded by the existing fill slot, timeout and spool-file limits.
-	ctx, cancel := context.WithTimeout(p.ctx, 2*time.Minute)
-	defer cancel()
-	if err := p.backend(public).Put(ctx, object, file, c.copied); err != nil {
-		p.metrics.errors.Add(1)
-		return nil
-	}
 	e := cachedResponse{Key: key, Scope: h.Scope, Status: d.status, Header: d.header, Vary: map[string]string{},
 		Lifetime: d.lifetime, InitialAge: d.initialAge, Responded: d.responded, Object: object, Bytes: c.copied, Public: public}
 	for _, name := range d.vary {
 		e.Vary[name] = digest(fieldValue(r.Header, name))
 	}
-	if err := p.publish(e, epoch); err != nil {
-		p.metrics.errors.Add(1)
-		return nil
+	// The worker owns the spool and its fill slot until upload completes. At most
+	// MaxConcurrentFills files/tasks exist, even when S3 stalls or clients disconnect.
+	transferred = p.startUpload(func() {
+		defer func() {
+			file.Close()
+			os.Remove(file.Name())
+			<-p.fills
+			if flight != nil {
+				flight.finish()
+			}
+		}()
+		ctx, cancel := context.WithTimeout(p.ctx, 2*time.Minute)
+		defer cancel()
+		if err := p.backend(public).Put(ctx, object, file, c.copied); err != nil {
+			p.metrics.errors.Add(1)
+			return
+		}
+		if err := p.publish(e, epoch); err != nil {
+			p.metrics.errors.Add(1)
+			return
+		}
+		p.metrics.fills.Add(1)
+	})
+	if transferred && flight != nil {
+		flight.background = true
 	}
-	p.metrics.fills.Add(1)
+
 	return nil
 }
 
@@ -303,11 +326,15 @@ func (h *Handler) fillPersistent(w http.ResponseWriter, r *http.Request, next ca
 // Hash every request header because Vary is unknown until the origin responds. A purge starts
 // a new generation, so post-purge requests never wait on an obsolete fill.
 type cacheFlight struct {
-	ready chan struct{}
-	once  sync.Once
+	ready      chan struct{}
+	once       sync.Once
+	finished   sync.Once
+	background bool
+	cleanup    func()
 }
 
 func (f *cacheFlight) release() { f.once.Do(func() { close(f.ready) }) }
+func (f *cacheFlight) finish()  { f.finished.Do(f.cleanup) }
 
 func (h *Handler) coalesceFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, key string, epoch uint64) error {
 	p := h.persistent
@@ -318,15 +345,20 @@ func (h *Handler) coalesceFill(w http.ResponseWriter, r *http.Request, next cadd
 	if flight == nil && len(p.flights) < p.config.MaxConcurrentFills {
 		flight = &cacheFlight{ready: make(chan struct{})}
 		p.flights[id] = flight
-		p.flightMu.Unlock()
-		defer func() {
+		flight.cleanup = func() {
 			p.flightMu.Lock()
 			delete(p.flights, id)
 			flight.release()
 			p.flightMu.Unlock()
+		}
+		p.flightMu.Unlock()
+		defer func() {
+			if !flight.background {
+				flight.finish()
+			}
 		}()
 		// Another fill may have published between our first lookup and registration.
-		return h.servePersistentAttempt(w, r, next, false, flight.release)
+		return h.servePersistentAttempt(w, r, next, false, flight)
 	}
 	p.flightMu.Unlock()
 	if flight != nil {
